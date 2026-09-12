@@ -12,12 +12,15 @@ A real-time GPU monitoring desklet for Cinnamon desktop that displays GPU comput
 - **Percentage labels** on Y-axis for easy reading
 - **Smooth animations** and hover effects
 - **Error handling** with graceful degradation
+- **Runtime power management** - allows idle NVIDIA offload GPUs to enter D3 sleep
 
 ## Requirements
 
 - NVIDIA GPU
 - `nvidia-smi` command-line utility installed
 - Cinnamon desktop environment
+- `fuser` from the `psmisc` package (required for power-aware monitoring to
+  distinguish real GPU clients without waking an idle GPU)
 
 ## Configuration
 
@@ -26,6 +29,8 @@ Right-click the desklet and select "Configure" to access settings:
 - **Update Interval**: How often to sample GPU data (0.1-10 seconds)
 - **Data Points**: Historical data to keep (60-3600 points)
 - **GPU Selection**: Choose which GPU to monitor
+- **Power-aware monitoring**: Pause polling after a configurable idle timeout on
+  secondary GPUs managed by Linux runtime power management
 - **Colors**: Customize compute, memory, temperature, background colors
 - **Size**: Adjust desklet dimensions
 - **Display Options**: Show/hide legend and temperature
@@ -43,6 +48,9 @@ The desklet shows:
 - **"NVIDIA GPU: Not Available"** - Ensure nvidia-smi is installed and working
 - **No data** - Check GPU index setting matches your system
 - **High CPU usage** - Increase update interval in settings
+- **Laptop battery drain** - Keep power-aware monitoring enabled. Continuous
+  `nvidia-smi` polling prevents some hybrid-graphics laptops from suspending the
+  NVIDIA GPU. Primary GPUs and GPUs driving a display are not paused.
 
 ## Version History
 

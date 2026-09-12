@@ -35,6 +35,22 @@
         "description": "GPU to Monitor",
         "tooltip": "Select which GPU to monitor"
     },
+    "power-aware-monitoring": {
+        "type": "checkbox",
+        "default": true,
+        "description": "Allow idle secondary GPUs to sleep",
+        "tooltip": "Pause nvidia-smi polling when an idle offload GPU can enter runtime suspend"
+    },
+    "idle-timeout": {
+        "type": "spinbutton",
+        "default": 5,
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "units": "seconds",
+        "description": "GPU idle timeout",
+        "tooltip": "How long an offload GPU must remain idle before polling is paused"
+    },
     "desklet-width": {
         "type": "spinbutton",
         "default": 400,

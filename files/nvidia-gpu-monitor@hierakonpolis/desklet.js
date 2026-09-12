@@ -30,6 +30,8 @@ NvidiaGPUDesklet.prototype = {
         this.tempColor = '#bf616a';
         this.showLegend = true;
         this.showTemperature = false;
+        this.powerAwareMonitoring = true;
+        this.idleTimeout = 5;
         this.deskletWidth = 400;
         this.deskletHeight = 300;
         this.backgroundColor = '#2e3440';
@@ -45,6 +47,8 @@ NvidiaGPUDesklet.prototype = {
         this.settings.bindProperty(Settings.BindingDirection.IN, "temp-color", "tempColor", this._onSettingsChanged, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "show-legend", "showLegend", this._onSettingsChanged, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "show-temperature", "showTemperature", this._onSettingsChanged, null);
+        this.settings.bindProperty(Settings.BindingDirection.IN, "power-aware-monitoring", "powerAwareMonitoring", this._onSettingsChanged, null);
+        this.settings.bindProperty(Settings.BindingDirection.IN, "idle-timeout", "idleTimeout", this._onSettingsChanged, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "desklet-width", "deskletWidth", this._onSettingsChanged, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "desklet-height", "deskletHeight", this._onSettingsChanged, null);
         this.settings.bindProperty(Settings.BindingDirection.IN, "background-color", "backgroundColor", this._onSettingsChanged, null);
@@ -62,6 +66,12 @@ NvidiaGPUDesklet.prototype = {
         this.maxDataPoints = this.dataPoints || 600;
         this.nvidiaAvailable = false;
         this.errorCount = 0;
+        this.gpuRuntimePaths = [];
+        this.gpuDevicePaths = [];
+        this.gpuClientDetectionAvailable = GLib.find_program_in_path('fuser') !== null;
+        this.idleSamples = 0;
+        this.waitingForSuspend = false;
+        this.observedSuspend = false;
         
         // UI setup
         this._setupUI();
@@ -189,17 +199,40 @@ NvidiaGPUDesklet.prototype = {
 
     _detectGPUs: function() {
         try {
-            let [result, stdout, stderr] = GLib.spawn_command_line_sync('nvidia-smi --list-gpus');
+            let [result, stdout, stderr] = GLib.spawn_command_line_sync(
+                'nvidia-smi --query-gpu=index,name,pci.bus_id --format=csv,noheader,nounits'
+            );
             if (result) {
-                const gpuLines = stdout.toString().split('\n').filter(line => line.includes('GPU'));
+                const gpuLines = stdout.toString().trim().split('\n').filter(line => line.trim());
                 this.gpuCount = gpuLines.length;
-                
-                // Extract GPU names for better identification
-                this.gpuNames = gpuLines.map(line => {
-                    const match = line.match(/GPU \d+: (.+?) \(UUID/);
-                    return match ? match[1] : `GPU ${this.gpuNames.length}`;
+
+                this.gpuNames = [];
+                this.gpuRuntimePaths = [];
+                this.gpuDevicePaths = [];
+                gpuLines.forEach(line => {
+                    const fields = line.split(',').map(value => value.trim());
+                    const index = parseInt(fields[0]);
+                    this.gpuNames[index] = fields[1] || `GPU ${index}`;
+
+                    // nvidia-smi uses an eight-digit PCI domain; sysfs normally uses four.
+                    const pciAddress = (fields[2] || '').replace(/^00000000:/, '0000:').toLowerCase();
+                    const devicePath = `/sys/bus/pci/devices/${pciAddress}`;
+                    const driverInfo = this._readTextFile(
+                        `/proc/driver/nvidia/gpus/${pciAddress}/information`
+                    );
+                    const minorMatch = driverInfo ? driverInfo.match(/^Device Minor:\s*(\d+)/m) : null;
+                    if (minorMatch) {
+                        this.gpuDevicePaths[index] = `/dev/nvidia${minorMatch[1]}`;
+                    }
+                    const bootVga = this._readTextFile(`${devicePath}/boot_vga`);
+                    const powerControl = this._readTextFile(`${devicePath}/power/control`);
+
+                    // Only secondary, runtime-PM-managed GPUs may be put into quiet mode.
+                    if (bootVga === '0' && powerControl === 'auto') {
+                        this.gpuRuntimePaths[index] = `${devicePath}/power/runtime_status`;
+                    }
                 });
-                
+
                 this.nvidiaAvailable = true;
                 this.errorCount = 0;
                 global.log(`NVIDIA Desklet: Detected ${this.gpuCount} GPU(s)`);
@@ -209,6 +242,56 @@ NvidiaGPUDesklet.prototype = {
         } catch (e) {
             this._handleNvidiaError('nvidia-smi not available', e.toString());
         }
+    },
+
+    _readTextFile: function(path) {
+        try {
+            const [success, contents] = GLib.file_get_contents(path);
+            return success ? contents.toString().trim() : null;
+        } catch (e) {
+            return null;
+        }
+    },
+
+    _getRuntimeStatus: function(gpuId) {
+        const path = this.gpuRuntimePaths[gpuId];
+        return path ? this._readTextFile(path) : null;
+    },
+
+    _hasGpuClients: function(gpuId) {
+        if (!this.gpuClientDetectionAvailable || !this.gpuDevicePaths[gpuId]) {
+            return false;
+        }
+
+        try {
+            const [spawned, stdout] = GLib.spawn_command_line_sync(`fuser ${this.gpuDevicePaths[gpuId]}`);
+            return spawned && stdout.toString().trim().length > 0;
+        } catch (e) {
+            return false;
+        }
+    },
+
+    _recordIdleSample: function() {
+        this.computeData.push(0);
+        this.memoryData.push(0);
+
+        if (this.showTemperature) {
+            // Temperature is unavailable in D3; retain the last known value.
+            const lastTemperature = this.temperatureData.length > 0
+                ? this.temperatureData[this.temperatureData.length - 1]
+                : 0;
+            this.temperatureData.push(lastTemperature);
+        }
+
+        if (this.computeData.length > this.maxDataPoints) {
+            this.computeData.shift();
+            this.memoryData.shift();
+            if (this.showTemperature) {
+                this.temperatureData.shift();
+            }
+        }
+
+        this.canvas.queue_repaint();
     },
 
     _handleNvidiaError: function(message, details) {
@@ -234,7 +317,38 @@ NvidiaGPUDesklet.prototype = {
         
         try {
             const gpuId = Math.min(this.gpuIndex || 0, Math.max(0, this.gpuCount - 1));
-            let query = 'utilization.gpu,utilization.memory,memory.used,memory.total';
+            const runtimeStatus = this._getRuntimeStatus(gpuId);
+            const canRuntimeSuspend = this.powerAwareMonitoring &&
+                this.gpuClientDetectionAvailable && runtimeStatus !== null;
+            const gpuName = this.gpuNames[gpuId] || `GPU ${gpuId}`;
+
+            if (canRuntimeSuspend && runtimeStatus === 'suspended') {
+                this.waitingForSuspend = true;
+                this.observedSuspend = true;
+                this.titleLabel.set_text(`${gpuName}: Sleeping (runtime D3)`);
+                this._recordIdleSample();
+                return;
+            }
+
+            if (canRuntimeSuspend && this.waitingForSuspend) {
+                if (this.observedSuspend) {
+                    // Something other than this desklet woke the GPU; resume monitoring.
+                    this.waitingForSuspend = false;
+                    this.observedSuspend = false;
+                    this.idleSamples = 0;
+                } else if (this._hasGpuClients(gpuId)) {
+                    // A game, compute job, or monitor opened this GPU. Resume within one
+                    // update interval without waking the GPU ourselves.
+                    this.waitingForSuspend = false;
+                    this.idleSamples = 0;
+                } else {
+                    this.titleLabel.set_text(`${gpuName}: Idle — allowing runtime sleep`);
+                    this._recordIdleSample();
+                    return;
+                }
+            }
+
+            let query = 'utilization.gpu,utilization.memory,memory.used,memory.total,display_active';
             
             if (this.showTemperature) {
                 query += ',temperature.gpu';
@@ -244,13 +358,28 @@ NvidiaGPUDesklet.prototype = {
             let [result, stdout, stderr] = GLib.spawn_command_line_sync(cmd);
             
             if (result && stdout.toString().trim()) {
-                const values = stdout.toString().trim().split(',').map(v => parseFloat(v.trim()));
+                const values = stdout.toString().trim().split(',').map(v => v.trim());
                 
-                const computeUsage = values[0] || 0;
-                const memoryUsage = values[1] || 0;
-                const memoryUsed = values[2] || 0;
-                const memoryTotal = values[3] || 1;
-                const temperature = this.showTemperature ? (values[4] || 0) : 0;
+                const computeUsage = parseFloat(values[0]) || 0;
+                const memoryUsage = parseFloat(values[1]) || 0;
+                const memoryUsed = parseFloat(values[2]) || 0;
+                const memoryTotal = parseFloat(values[3]) || 1;
+                const displayActive = (values[4] || '').toLowerCase() === 'enabled';
+                const temperature = this.showTemperature ? (parseFloat(values[5]) || 0) : 0;
+
+                if (canRuntimeSuspend && !displayActive && computeUsage === 0 && memoryUsage === 0) {
+                    this.idleSamples++;
+                    const idleSampleLimit = Math.max(1, Math.ceil(
+                        Math.max(1, this.idleTimeout || 5) / Math.max(0.1, this.updateInterval || 0.2)
+                    ));
+                    if (this.idleSamples >= idleSampleLimit) {
+                        this.waitingForSuspend = true;
+                    }
+                } else {
+                    this.idleSamples = 0;
+                    this.waitingForSuspend = false;
+                    this.observedSuspend = false;
+                }
                 
                 // Store data points
                 this.computeData.push(computeUsage);
@@ -273,7 +402,6 @@ NvidiaGPUDesklet.prototype = {
                 }
                 
                 // Update title with current values and GPU name
-                const gpuName = this.gpuNames[gpuId] || `GPU ${gpuId}`;
                 let titleText = `${gpuName}: ${computeUsage}% Compute | ${memoryUsage}% Mem (${Math.round(memoryUsed)}MB)`;
                 if (this.showTemperature) {
                     titleText += ` | ${temperature}°C`;
@@ -462,6 +590,9 @@ NvidiaGPUDesklet.prototype = {
         // Settings updated
         
         this.maxDataPoints = this.dataPoints || 600;
+        this.idleSamples = 0;
+        this.waitingForSuspend = false;
+        this.observedSuspend = false;
         
         // Clear temperature data if temperature was just enabled to avoid mismatched arrays
         if (this.showTemperature && this.temperatureData.length === 0 && this.computeData.length > 0) {
